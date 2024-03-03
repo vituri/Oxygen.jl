@@ -8,6 +8,10 @@ module ParallelDemo
     using SwaggerMarkdown
     using Base.Threads
 
+    get("/") do 
+        text("hello world")
+    end
+
     ############## Atomic variable example ##############
 
     StructTypes.StructType(::Type{Atomic{Int64}}) = StructTypes.Struct()
@@ -44,6 +48,6 @@ module ParallelDemo
     end
 
     # start the web server in parallel mode
-    serveparallel()
+    serveparallel(access_log=nothing)
 
 end

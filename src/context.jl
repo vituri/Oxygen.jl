@@ -44,7 +44,6 @@ end
     router              :: Router                   = Router()
     custommiddleware    :: Dict{String, Tuple}      = Dict{String, Tuple}()
     history             :: History                  = History(1_000_000)
-    history_lock        :: ReentrantLock            = ReentrantLock()
 end
 
 @kwdef struct Context

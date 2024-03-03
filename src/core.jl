@@ -124,7 +124,7 @@ function serveparallel(ctx::Context;
     configured_middelware = setupmiddleware(ctx; middleware, serialize, catch_errors, docs, metrics, show_errors)
 
     # setup the primary stream handler function (can be customized by the caller)
-    handle_stream = handler(configured_middelware) |> parallel_stream_handler 
+    handle_stream = handler(configured_middelware) 
 
     return startserver(ctx, show_banner, host, port, docs, metrics, kwargs, async, (kwargs) -> 
         HTTP.serve!(handle_stream, host, port; kwargs...))
@@ -208,14 +208,26 @@ end
 This function uses `Threads.@spawn` to schedule a new task on any available thread. 
 Inside this task, `@async` is used for cooperative multitasking, allowing the task to yield during I/O operations. 
 """
-function parallel_stream_handler(handle_stream::Function)
-    function(stream::HTTP.Stream)
-        task = Threads.@spawn begin 
-            handle = @async handle_stream(stream)  
-            wait(handle)
+function parallel_request_handler(handle::Function)
+    function(request::HTTP.Request)
+        run_in_background() do 
+            handle(request)
         end
-        wait(task)
+
+        # task = Threads.@spawn begin 
+        #     handle_task = @async handle(request)  
+        #     fecth(handle_task)
+        # end
+        # fetch(task)
     end
+end
+
+function run_in_background(handle::Function)
+    task = Threads.@spawn begin 
+        handle_task = @async handle()
+        fecth(handle_task)
+    end
+    fetch(task)
 end
 
 
@@ -224,7 +236,7 @@ Compose the user & internally defined middleware functions together. Practically
 users to 'chain' middleware functions like `serve(handler1, handler2, handler3)` when starting their 
 application and have them execute in the order they were passed (left to right) for each incoming request
 """
-function setupmiddleware(ctx::Context; middleware::Vector=[], docs::Bool=true, metrics::Bool=true, serialize::Bool=true, catch_errors::Bool=true, show_errors=true) :: Function
+function setupmiddleware(ctx::Context; middleware=[], docs=true, metrics=true, serialize=true, catch_errors=true, show_errors=true, parallel=false) :: Function
 
     # determine if we have any special router or route-specific middleware
     custom_middleware = hasmiddleware(ctx.service.custommiddleware) ? [compose(ctx.service.router, middleware, ctx.service.custommiddleware)] : reverse(middleware)
@@ -238,11 +250,15 @@ function setupmiddleware(ctx::Context; middleware::Vector=[], docs::Bool=true, m
     # check if we need to track metrics
     collect_metrics = metrics ? [MetricsMiddleware(ctx.service, metrics)] : []
 
+    # check if we should handle this request using any available threads
+    parallel_middleware = parallel ? [parallel_request_handler] : []
+
     # combine all our middleware functions
     return reduce(|>, [
         ctx.service.router,
         serializer...,
         custom_middleware...,
+        parallel_middleware...,
         collect_metrics...,
         docs_middleware...,
     ])    
@@ -352,28 +368,26 @@ function MetricsMiddleware(service::Service, catch_errors::Bool)
                 # Log response time
                 response_time = (time() - start_time) * 1000
                 # Make sure we update the History object in a thread-safe way
-                lock(service.history_lock) do 
-                    if response.status == 200
-                        push_history(service.history, HTTPTransaction(
-                            string(req.context[:ip]),
-                            string(req.target),
-                            now(UTC),
-                            response_time,
-                            true,
-                            response.status,
-                            nothing
-                        ))
-                    else 
-                        push_history(service.history, HTTPTransaction(
-                            string(req.context[:ip]),
-                            string(req.target),
-                            now(UTC),
-                            response_time,
-                            false,
-                            response.status,
-                            text(response)
-                        ))
-                    end
+                if response.status == 200
+                    push_history(service.history, HTTPTransaction(
+                        string(req.context[:ip]),
+                        string(req.target),
+                        now(UTC),
+                        response_time,
+                        true,
+                        response.status,
+                        nothing
+                    ))
+                else 
+                    push_history(service.history, HTTPTransaction(
+                        string(req.context[:ip]),
+                        string(req.target),
+                        now(UTC),
+                        response_time,
+                        false,
+                        response.status,
+                        text(response)
+                    ))
                 end
                 return response
             end
@@ -557,11 +571,11 @@ function setupdocs(router::Router, schema::Dict, docspath::String, schemapath::S
 end
 
 function setupmetrics(context::Context)
-    setupmetrics(context.docs.router[], context.service.history, context.docs.docspath[], context.service.history_lock)
+    setupmetrics(context.docs.router[], context.service.history, context.docs.docspath[])
 end
 
 # add the swagger and swagger/schema routes 
-function setupmetrics(router::Router, history::History, docspath::String, history_lock::ReentrantLock)
+function setupmetrics(router::Router, history::History, docspath::String)
 
     # This allows us to customize the path to the metrics dashboard
     function loadfile(filepath) :: String
@@ -576,38 +590,29 @@ function setupmetrics(router::Router, history::History, docspath::String, histor
     end
 
     staticfiles(router, "$DATA_PATH/dashboard", "$docspath/metrics"; loadfile=loadfile)
-
-
-    """
-    Create a thread-safe copy of the history object and it's internal data
-    """
-    function safe_get_transactions(history::History) :: Vector{HTTPTransaction}
-        transactions = []
-        lock(history_lock) do
-            transactions = collect(history)
-        end
-        return transactions
-    end
     
     function metrics(req::HTTP.Request, window::Nullable{Int}, latest::Nullable{DateTime})
-
-        # create a threadsafe copy of the current transactions in our history object
-        transactions = safe_get_transactions(history)
-        
-        # Figure out how far back to read from the history object
-        window_value = !isnothing(window) && window > 0 ? Minute(window) : nothing
-        lower_bound = !isnothing(latest) ? latest : window_value
-        
-        return Dict(
-            "server"     => server_metrics(transactions, nothing),
-            "endpoints"  => all_endpoint_metrics(transactions, nothing),
-            "errors"     => error_distribution(transactions, nothing),
-            "avg_latency_per_second" => avg_latency_per_unit(transactions, Second, lower_bound)   |> prepare_timeseries_data(),
-            "requests_per_second"    => requests_per_unit(transactions, Second, lower_bound)      |> prepare_timeseries_data(),
-            "avg_latency_per_minute" => avg_latency_per_unit(transactions, Minute, lower_bound)   |> prepare_timeseries_data(),
-            "requests_per_minute"    => requests_per_unit(transactions, Minute, lower_bound)      |> prepare_timeseries_data()
-        )
-        
+        task = Threads.@spawn begin 
+            handle_task = @async begin 
+                transactions = collect(history)
+                
+                # Figure out how far back to read from the history object
+                window_value = !isnothing(window) && window > 0 ? Minute(window) : nothing
+                lower_bound = !isnothing(latest) ? latest : window_value
+                
+                return Dict(
+                    "server"     => server_metrics(transactions, nothing),
+                    "endpoints"  => all_endpoint_metrics(transactions, nothing),
+                    "errors"     => error_distribution(transactions, nothing),
+                    "avg_latency_per_second" => avg_latency_per_unit(transactions, Second, lower_bound)   |> prepare_timeseries_data(),
+                    "requests_per_second"    => requests_per_unit(transactions, Second, lower_bound)      |> prepare_timeseries_data(),
+                    "avg_latency_per_minute" => avg_latency_per_unit(transactions, Minute, lower_bound)   |> prepare_timeseries_data(),
+                    "requests_per_minute"    => requests_per_unit(transactions, Minute, lower_bound)      |> prepare_timeseries_data()
+                )
+            end 
+            fetch(handle_task)
+        end
+        fetch(task)
     end
 
     register(router, "GET", "$docspath/metrics/data/{window}/{latest}", metrics)
