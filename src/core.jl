@@ -210,24 +210,12 @@ Inside this task, `@async` is used for cooperative multitasking, allowing the ta
 """
 function parallel_request_handler(handle::Function)
     function(request::HTTP.Request)
-        run_in_background() do 
-            handle(request)
+        task = Threads.@spawn begin 
+            handle_task = @async handle(request)  
+            fecth(handle_task)
         end
-
-        # task = Threads.@spawn begin 
-        #     handle_task = @async handle(request)  
-        #     fecth(handle_task)
-        # end
-        # fetch(task)
+        fetch(task)
     end
-end
-
-function run_in_background(handle::Function)
-    task = Threads.@spawn begin 
-        handle_task = @async handle()
-        fecth(handle_task)
-    end
-    fetch(task)
 end
 
 
@@ -592,6 +580,7 @@ function setupmetrics(router::Router, history::History, docspath::String)
     staticfiles(router, "$DATA_PATH/dashboard", "$docspath/metrics"; loadfile=loadfile)
     
     function metrics(req::HTTP.Request, window::Nullable{Int}, latest::Nullable{DateTime})
+        # use other threads if they're available
         task = Threads.@spawn begin 
             handle_task = @async begin 
                 transactions = collect(history)
